@@ -4,13 +4,15 @@ import sqlite3
 from pathlib import Path
 import logging
 import sys
+import os
 
 # Set up logging
+os.makedirs('/app/logs', exist_ok=True)
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('parser_debug.log'),
+        logging.FileHandler('/app/logs/parser_debug.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -31,85 +33,94 @@ def extract_karaoke_data(pdf_path, start_page=1, end_page=None):
             tables = tabula.read_pdf(
                 pdf_path,
                 pages='all',
-                multiple_tables=True,
+                multiple_tables=False,  # Changed to False
                 lattice=True
             )
-            end_page = len(tables)
-            logging.info(f"Detected {end_page} pages in PDF")
+            end_page = 316  # Hardcoded for now
+            logging.info(f"Processing {end_page} pages in PDF")
         except Exception as e:
             logging.error(f"Error detecting total pages: {str(e)}")
-            end_page = 316  # Fallback to known number of pages
+            end_page = 316
 
-    # Process pages in smaller chunks to avoid memory issues
-    chunk_size = 10
-    for chunk_start in range(start_page, end_page + 1, chunk_size):
-        chunk_end = min(chunk_start + chunk_size - 1, end_page)
-        logging.info(f"Processing pages {chunk_start} to {chunk_end}")
+    # Process pages one at a time to better handle issues
+    for page_num in range(start_page, end_page + 1):
+        logging.info(f"Processing page {page_num}")
         
         try:
-            # Read chunk of pages
+            # Modified parameters for better table detection
             tables = tabula.read_pdf(
                 pdf_path,
-                pages=f"{chunk_start}-{chunk_end}",
-                multiple_tables=True,
+                pages=str(page_num),
+                multiple_tables=False,  # Changed to False
                 lattice=True,
-                guess=False,
+                guess=True,  # Enable layout guessing
                 pandas_options={
-                    'header': None  # We'll handle headers manually
+                    'header': None,
+                    'error_bad_lines': False,
+                    'warn_bad_lines': True
                 }
             )
             
-            logging.info(f"Found {len(tables)} tables in pages {chunk_start}-{chunk_end}")
+            if not isinstance(tables, list):
+                tables = [tables]
             
-            # Process each table in the chunk
-            for page_idx, table in enumerate(tables, start=chunk_start):
+            for table in tables:
                 try:
-                    # Check if table is empty
                     if table.empty:
-                        logging.warning(f"Empty table on page {page_idx}")
-                        failed_pages.append(page_idx)
+                        logging.warning(f"Empty table on page {page_num}")
+                        failed_pages.append(page_num)
                         continue
                     
-                    # Drop the header row if it exists
+                    # Ensure correct number of columns
+                    if len(table.columns) != 5:
+                        # Try to fix column issues
+                        if len(table.columns) > 5:
+                            table = table.iloc[:, :5]  # Take first 5 columns
+                        else:
+                            logging.warning(f"Wrong number of columns on page {page_num}: {len(table.columns)}")
+                            failed_pages.append(page_num)
+                            continue
+                    
+                    # Drop header row if it exists
                     if 'Interprete' in str(table.iloc[0]) or 'Cod' in str(table.iloc[0]):
                         table = table.iloc[1:]
                     
-                    # Assign correct column names
+                    # Assign column names
                     table.columns = ['Interprete', 'Cod', 'Titulo', 'Inicio da letra', 'Idioma']
-                    
-                    # Basic validation
-                    if len(table.columns) != 5:
-                        logging.warning(f"Wrong number of columns on page {page_idx}: {len(table.columns)}")
-                        failed_pages.append(page_idx)
-                        continue
                     
                     # Clean up data
                     table = table.fillna('')
-                    table['Cod'] = table['Cod'].astype(str).str.strip()
-                    table['Interprete'] = table['Interprete'].str.strip()
-                    table['Titulo'] = table['Titulo'].str.strip()
-                    table['Inicio da letra'] = table['Inicio da letra'].str.strip()
-                    table['Idioma'] = table['Idioma'].str.strip()
+                    for col in table.columns:
+                        table[col] = table[col].astype(str).str.strip()
                     
-                    # Add page number for debugging
-                    table['Page'] = page_idx
+                    # Add page number
+                    table['Page'] = page_num
                     
-                    all_dataframes.append(table)
-                    logging.info(f"Successfully processed page {page_idx} with {len(table)} rows")
+                    # Basic validation
+                    if len(table) > 0:
+                        all_dataframes.append(table)
+                        logging.info(f"Successfully processed page {page_num} with {len(table)} rows")
+                    else:
+                        logging.warning(f"No valid data on page {page_num}")
+                        failed_pages.append(page_num)
                     
                 except Exception as e:
-                    logging.error(f"Error processing table on page {page_idx}: {str(e)}")
-                    failed_pages.append(page_idx)
+                    logging.error(f"Error processing table on page {page_num}: {str(e)}")
+                    failed_pages.append(page_num)
                     
         except Exception as e:
-            logging.error(f"Error processing chunk {chunk_start}-{chunk_end}: {str(e)}")
-            failed_pages.extend(range(chunk_start, chunk_end + 1))
+            logging.error(f"Error processing page {page_num}: {str(e)}")
+            failed_pages.append(page_num)
     
     if not all_dataframes:
         raise Exception("No data was successfully extracted")
     
     # Combine all successful extractions
     df = pd.concat(all_dataframes, ignore_index=True)
+    
+    # Save debug CSV to data directory
+    os.makedirs('/app/data', exist_ok=True)
+    df.to_csv('/app/data/extracted_data_debug.csv', index=False)
     
     # Log summary
     logging.info(f"Extraction complete:")
@@ -123,6 +134,9 @@ def save_to_sqlite(df, db_path):
     Save extracted data to SQLite database with validation
     """
     logging.info(f"Saving data to {db_path}")
+    
+    # Ensure data directory exists
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     
     conn = sqlite3.connect(db_path)
     
@@ -168,28 +182,17 @@ def save_to_sqlite(df, db_path):
         conn.close()
 
 def main():
-    pdf_path = 'karaoke_list.pdf'  # Update with your PDF path
-    db_path = 'karaoke.db'
-    
-    # Optional: Process specific page range
-    start_page = 1
-    end_page = 316  # or None to auto-detect
+    pdf_path = 'karaoke_list.pdf'
+    db_path = '/app/data/karaoke.db'
     
     try:
-        df, failed_pages = extract_karaoke_data(pdf_path, start_page, end_page)
-        
-        # Save extracted data
+        df, failed_pages = extract_karaoke_data(pdf_path)
         save_to_sqlite(df, db_path)
         
-        # Generate debug summary
-        print("\nExtraction Summary:")
-        print(f"Total songs extracted: {len(df)}")
-        print(f"Failed pages: {failed_pages}")
-        print(f"Sample of extracted data:")
-        print(df.head())
-        
-        # Save debug info to file
-        df.to_csv('extracted_data_debug.csv', index=False)
+        # Generate summary file
+        with open('/app/data/extraction_summary.txt', 'w') as f:
+            f.write(f"Total songs extracted: {len(df)}\n")
+            f.write(f"Failed pages: {failed_pages}\n")
         
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
